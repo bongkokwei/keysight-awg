@@ -12,10 +12,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import time
 
-from m8195a import M8195A
-from m8195a_tools import configure_single_channel, load_and_play
-from multitone_generator import MultiToneGenerator, ToneSpec
-from rigol_dho4204 import DHO4204
+from keysight_awg import M8195A, configure_single_channel, load_and_play
+from keysight_awg import MultiToneGenerator, ToneSpec
 
 # ---------------------------------------------------------------------------
 # Configuration

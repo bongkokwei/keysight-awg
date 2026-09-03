@@ -1,4 +1,4 @@
-from m8195a import M8195A
+from keysight_awg import M8195A
 
 with M8195A(host="WINDOWS-QNNRGV2") as awg:
     awg.abort()

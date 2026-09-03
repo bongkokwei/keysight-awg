@@ -5,7 +5,7 @@ Default resource: TCPIP0::localhost::hislip0::INSTR
 """
 
 import sys
-from m8195a import M8195A
+from keysight_awg import M8195A
 
 RESOURCE = sys.argv[1] if len(sys.argv) > 1 else "TCPIP0::localhost::hislip0::INSTR"
 

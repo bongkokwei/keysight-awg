@@ -11,4 +11,3 @@ venv/
 .pytest_cache/
 docs/
 .superpowers/
-tests/

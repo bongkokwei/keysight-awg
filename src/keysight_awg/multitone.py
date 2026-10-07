@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import math
+import warnings
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
+
+from keysight_awg.tools import (
+    DEFAULT_LENGTH,
+    SINGLE_CHANNEL_GRANULARITY,
+    check_waveform_length,
+    quantise_frequency,
+)
 
 
 @dataclass
@@ -36,20 +44,19 @@ class MultiToneGenerator:
     connected instrument instance, so waveforms can be designed and
     inspected offline.
 
-    The buffer length is chosen to contain an integer number of cycles of
-    *every* tone, avoiding loop-boundary discontinuities.  The fundamental
-    period is determined by the GCD of all tone frequencies:
+    The buffer has a fixed length :math:`L` and every tone is snapped to an
+    integer number of cycles in it, so the looped waveform is
+    phase-continuous at the loop boundary:
 
     .. math::
 
-        f_{\\text{fund}} = \\gcd(f_1, f_2, \\ldots, f_k)
+        n_k = \\operatorname{round}\\!\\left(\\frac{f_k L}{f_s}\\right),
+        \\qquad f_{k,\\text{out}} = \\frac{n_k f_s}{L}
 
-        N_{\\text{raw}} = \\frac{f_s}{f_{\\text{fund}}} \\times n_{\\text{cycles}}
-
-        N = \\lceil N_{\\text{raw}} / G \\rceil \\times G
-
-    where :math:`G` is the waveform granularity (256 for [SINGle]-channel
-    mode, 128 for dual, 64 for four-channel).
+    Each tone is therefore played within :math:`f_s / 2L` of its request;
+    use :meth:`actual_frequencies` to see the values.  :math:`L` must be a
+    multiple of the waveform granularity :math:`G` (256 for [SINGle]-channel
+    mode, 128 for dual, 64 for four-channel) and at least :math:`5G`.
 
     Peak-to-average power ratio (PAPR) can be reduced by applying
     Schroeder phases instead of zero phases:
@@ -66,35 +73,35 @@ class MultiToneGenerator:
     sample_rate : float
         AWG waveform sample rate in Sa/s (e.g. 65e9 for [SINGle]-channel
         mode at maximum rate).
+    length : int
+        Buffer length in samples.  Default is :math:`2^{16}`.  The frequency
+        resolution is :math:`f_s / L`; increase it for closely spaced or
+        low-frequency tones.
     granularity : int
         Waveform length granularity in samples.  Defaults to 256
         ([SINGle]-channel mode).
-    num_cycles : int
-        Number of fundamental periods in the buffer.  Default is 1.
-        Increasing this improves frequency resolution at the cost of
-        waveform memory.
     use_schroeder_phases : bool
         If ``True``, override ``phase_deg`` on all tones with Schroeder
         phases to minimise PAPR.  Default is ``False``.
 
     Examples
     --------
-    >>> gen = MultiToneGenerator(sample_rate=65e9)
+    >>> gen = MultiToneGenerator(sample_rate=64e9)
     >>> tones = [
-    ...     ToneSpec(frequency=1e6, amplitude=0.3),
-    ...     ToneSpec(frequency=2e6, amplitude=0.3),
-    ...     ToneSpec(frequency=3e6, amplitude=0.3),
+    ...     ToneSpec(frequency=1e9, amplitude=0.3),
+    ...     ToneSpec(frequency=2e9, amplitude=0.3),
+    ...     ToneSpec(frequency=3e9, amplitude=0.3),
     ... ]
     >>> waveform = gen.generate(tones)
     >>> waveform.shape
-    (65000,)
+    (65536,)
     """
 
     def __init__(
         self,
-        sample_rate: float = 65e9,
-        granularity: int = 256,
-        num_cycles: int = 1,
+        sample_rate: float = 64e9,
+        length: int = DEFAULT_LENGTH,
+        granularity: int = SINGLE_CHANNEL_GRANULARITY,
         use_schroeder_phases: bool = False,
     ) -> None:
         if sample_rate <= 0:
@@ -103,12 +110,11 @@ class MultiToneGenerator:
             raise ValueError(
                 f"granularity must be a positive power of 2, got {granularity}"
             )
-        if num_cycles < 1:
-            raise ValueError(f"num_cycles must be >= 1, got {num_cycles}")
+        check_waveform_length(length, granularity)
 
         self.sample_rate = sample_rate
+        self.length = length
         self.granularity = granularity
-        self.num_cycles = num_cycles
         self.use_schroeder_phases = use_schroeder_phases
 
     # ------------------------------------------------------------------
@@ -128,34 +134,42 @@ class MultiToneGenerator:
         Returns
         -------
         numpy.ndarray
-            Floating-point waveform samples normalised to [-1, 1].  Length
-            is a multiple of ``self.granularity``.
+            Floating-point waveform samples normalised to [-1, 1], of
+            length ``self.length``.  Tones play at
+            :meth:`actual_frequencies`.
 
         Raises
         ------
         ValueError
-            If *tones* is empty, any frequency is non-positive or exceeds
-            the Nyquist limit, or any amplitude is outside (0, 1].
+            If *tones* is empty, any frequency rounds to DC or to/above the
+            Nyquist limit, or any amplitude is outside (0, 1].
         """
         if not tones:
             raise ValueError("tones must contain at least one ToneSpec")
 
         self._validate_tones(tones)
 
-        num_samples = self._compute_num_samples(tones)
+        cycles = self._compute_cycles(tones)
+        if len(set(cycles)) < len(cycles):
+            warnings.warn(
+                "Two or more tones round to the same frequency bin "
+                f"(resolution {self.sample_rate / self.length} Hz); "
+                "increase length to separate them.",
+                UserWarning,
+                stacklevel=2,
+            )
         phases = self._compute_phases(tones)
 
-        t = np.arange(num_samples) / self.sample_rate
-        waveform = np.zeros(num_samples, dtype=np.float64)
+        t = np.arange(self.length)
+        waveform = np.zeros(self.length, dtype=np.float64)
 
-        for spec, phase_rad in zip(tones, phases):
+        for spec, n, phase_rad in zip(tones, cycles, phases):
             waveform += spec.amplitude * np.sin(
-                2.0 * np.pi * spec.frequency * t + phase_rad
+                2.0 * np.pi * n * t / self.length + phase_rad
             )
 
         peak = np.max(np.abs(waveform))
         if peak > 1.0:
-            import warnings
             warnings.warn(
                 f"Waveform peak amplitude {peak:.3f} exceeds 1.0; "
                 "normalising to prevent DAC clipping.  "
@@ -166,6 +180,14 @@ class MultiToneGenerator:
             waveform /= peak
 
         return waveform
+
+    def actual_frequencies(self, tones: Sequence[ToneSpec]) -> list[float]:
+        """Return the frequency, in Hz, at which each tone is actually played.
+
+        Each is :math:`n_k f_s / L` with
+        :math:`n_k = \\operatorname{round}(f_k L / f_s)`.
+        """
+        return [n * self.sample_rate / self.length for n in self._compute_cycles(tones)]
 
     def papr_db(self, waveform: np.ndarray) -> float:
         """Return the peak-to-average power ratio of *waveform* in dB.
@@ -184,36 +206,22 @@ class MultiToneGenerator:
     # ------------------------------------------------------------------
 
     def _validate_tones(self, tones: Sequence[ToneSpec]) -> None:
-        nyquist = self.sample_rate / 2.0
         for i, spec in enumerate(tones):
-            if spec.frequency <= 0:
-                raise ValueError(
-                    f"tones[{i}].frequency must be positive, got {spec.frequency}"
-                )
-            if spec.frequency >= nyquist:
-                raise ValueError(
-                    f"tones[{i}].frequency {spec.frequency} Hz exceeds "
-                    f"Nyquist limit {nyquist} Hz"
-                )
+            try:
+                quantise_frequency(spec.frequency, self.sample_rate, self.length)
+            except ValueError as exc:
+                raise ValueError(f"tones[{i}]: {exc}") from None
             if not (0.0 < spec.amplitude <= 1.0):
                 raise ValueError(
                     f"tones[{i}].amplitude must be in (0, 1], got {spec.amplitude}"
                 )
 
-    def _compute_num_samples(self, tones: Sequence[ToneSpec]) -> int:
-        """Return the smallest valid buffer length covering all tones.
-
-        Uses integer arithmetic on Hz values (rounded to the nearest
-        millihertz) to avoid floating-point GCD errors.
-        """
-        # Scale to mHz integers for robust GCD computation.
-        scale = 1000
-        int_freqs = [round(spec.frequency * scale) for spec in tones]
-        fund_mhz = math.gcd(*int_freqs)
-        fund_hz = fund_mhz / scale
-
-        raw = round(self.sample_rate / fund_hz * self.num_cycles)
-        return int(math.ceil(raw / self.granularity) * self.granularity)
+    def _compute_cycles(self, tones: Sequence[ToneSpec]) -> list[int]:
+        """Return the integer cycle count of each tone in the buffer."""
+        return [
+            quantise_frequency(spec.frequency, self.sample_rate, self.length)
+            for spec in tones
+        ]
 
     def _compute_phases(self, tones: Sequence[ToneSpec]) -> list[float]:
         """Return per-tone initial phases in radians."""

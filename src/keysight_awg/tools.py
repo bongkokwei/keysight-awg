@@ -7,11 +7,18 @@ waveform load-and-play, sine generation, etc.).
 
 Usage:
     from keysight_awg.m8195a import M8195A
+
+#: Waveform length granularity in [SINGle]-channel mode (samples).
+SINGLE_CHANNEL_GRANULARITY = 256
+#: Minimum segment length, in units of the granularity (1280 samples SINGle).
+MIN_SEGMENT_VECTORS = 5
+#: Default waveform buffer length (samples).
+DEFAULT_LENGTH = 2**16
     from keysight_awg.tools import configure_single_channel, generate_sine
 
     with M8195A("169.254.x.x") as awg:
         configure_single_channel(awg)
-        generate_sine(awg, channel=1, frequency=10e6)
+        generate_sine(awg, channel=1, frequency=10e9)
 """
 
 from __future__ import annotations
@@ -19,6 +26,13 @@ from __future__ import annotations
 import numpy as np
 
 from keysight_awg.m8195a import M8195A
+
+#: Waveform length granularity in [SINGle]-channel mode (samples).
+SINGLE_CHANNEL_GRANULARITY = 256
+#: Minimum segment length, in units of the granularity (1280 samples SINGle).
+MIN_SEGMENT_VECTORS = 5
+#: Default waveform buffer length (samples).
+DEFAULT_LENGTH = 2**16
 
 
 def configure_single_channel(
@@ -88,20 +102,73 @@ def load_and_play(
     awg.start(channel)
 
 
+def check_waveform_length(length: int, granularity: int = SINGLE_CHANNEL_GRANULARITY) -> None:
+    """Raise ``ValueError`` unless *length* is a valid M8195A segment length.
+
+    A segment must be a whole number of *granularity* samples (256 in
+    [SINGle]-channel mode) and at least ``MIN_SEGMENT_VECTORS`` (5) of them,
+    i.e. at least 1280 samples in [SINGle]-channel mode.
+    """
+    if length < MIN_SEGMENT_VECTORS * granularity or length % granularity != 0:
+        raise ValueError(
+            f"length must be a multiple of {granularity} and at least "
+            f"{MIN_SEGMENT_VECTORS * granularity} samples, got {length}"
+        )
+
+
+def quantise_frequency(frequency: float, sample_rate: float, length: int) -> int:
+    """Return the integer cycle count *n* whose tone is closest to *frequency*.
+
+    A buffer of *length* samples looped at *sample_rate* can only hold tones
+    at :math:`f = n f_s / L`, so the request is rounded to
+
+    .. math::
+
+        n = \\operatorname{round}\\!\\left(\\frac{f L}{f_s}\\right)
+
+    Raises
+    ------
+    ValueError
+        If *frequency* is not strictly positive, or *n* falls outside
+        ``1 <= n < length / 2`` (i.e. the tone rounds to DC or to Nyquist).
+    """
+    if frequency <= 0:
+        raise ValueError(f"frequency must be positive, got {frequency}")
+    n = round(frequency * length / sample_rate)
+    resolution = sample_rate / length
+    if n < 1:
+        raise ValueError(
+            f"frequency {frequency} Hz is below the resolution {resolution} Hz "
+            f"of a {length}-sample buffer; increase length"
+        )
+    if 2 * n >= length:
+        raise ValueError(
+            f"frequency {frequency} Hz exceeds Nyquist limit {sample_rate / 2} Hz"
+        )
+    return n
+
+
 def generate_sine(
     awg: M8195A,
     channel: int = 1,
-    frequency: float = 1e6,
-    num_cycles: int = 1,
+    frequency: float = 1e9,
+    length: int = DEFAULT_LENGTH,
     segment_id: int = 1,
-) -> None:
+) -> float:
     """Generate and play a sine wave on *channel*.
 
-    Computes the waveform length automatically from the instrument's current
-    sample rate and the requested frequency, ensuring:
+    The buffer has a fixed *length* and holds an integer number of cycles
+    *n*, so the looped output is phase-continuous.  The tone actually played
+    is
 
-    - an integer number of complete cycles (no looping discontinuity), and
-    - a length that is a multiple of 256 (single-channel granularity).
+    .. math::
+
+        f_{\\text{out}} = \\frac{n f_s}{L}, \\qquad
+        n = \\operatorname{round}\\!\\left(\\frac{f L}{f_s}\\right)
+
+    so :math:`|f_{\\text{out}} - f| \\le f_s / 2L` (about 488 kHz at
+    64 GSa/s with the default :math:`L = 2^{16}`).  Increase *length* for
+    finer resolution, e.g. for MHz-scale tones.
 
     The effective waveform sample rate is ``awg.sample_rate``, so
     ``configure_single_channel`` (or equivalent) must be called first to set
@@ -114,55 +181,39 @@ def generate_sine(
     channel : int
         Target channel (default 1).
     frequency : float
-        Sine frequency in Hz (default 1 MHz).  Must satisfy
-        ``frequency < awg.sample_rate / 2`` (Nyquist limit).
-    num_cycles : int
-        Number of complete sine cycles in the waveform buffer (default 1).
-        Increasing this value improves frequency resolution at the cost of
-        more waveform memory.
+        Requested sine frequency in Hz (default 1 GHz).
+    length : int
+        Waveform length in samples (default :math:`2^{16}`).  Must be a
+        multiple of 256 and at least 1280 ([SINGle]-channel granularity).
     segment_id : int
         Segment identifier to use (default 1).
+
+    Returns
+    -------
+    float
+        The frequency actually played, :math:`n f_s / L`, in Hz.
 
     Raises
     ------
     ValueError
-        If *frequency* is not strictly positive, or exceeds the Nyquist
-        frequency (``awg.sample_rate / 2``).
-
-    Notes
-    -----
-    The minimum samples-per-cycle at 65 GSa/s for a 1 MHz sine is:
-
-        N_cycle = f_s / f = 65e9 / 1e6 = 65 000 samples/cycle
-
-    The raw count is rounded up to the next multiple of 256 (granularity
-    for [SINGle]-channel mode) before the waveform array is allocated.
-    Using fewer samples than one full period produces a sawtooth-like
-    artefact because the DAC loops a tiny linear ramp of the sine rather
-    than a complete oscillation.
+        If *length* is not a valid segment length, or *frequency* rounds to
+        DC or to/above the Nyquist frequency.
 
     Examples
     --------
     >>> with M8195A("WINDOWS-QNNRGV2") as awg:
-    ...     configure_single_channel(awg, sample_rate=65e9)
-    ...     generate_sine(awg, channel=1, frequency=1e6, num_cycles=1)
+    ...     configure_single_channel(awg, sample_rate=64e9)
+    ...     f_out = generate_sine(awg, channel=1, frequency=10e9)
     """
-    sr = awg.sample_rate
-    if frequency <= 0:
-        raise ValueError(f"frequency must be positive, got {frequency}")
-    if frequency >= sr / 2:
-        raise ValueError(f"frequency {frequency} Hz exceeds Nyquist limit {sr / 2} Hz")
+    check_waveform_length(length)
+    sample_rate = awg.sample_rate
+    n = quantise_frequency(frequency, sample_rate, length)
 
-    granularity = 256
-    raw = round(sr / frequency * num_cycles)
-    num_samples = int(np.ceil(raw / granularity) * granularity)
-
-    t = np.arange(num_samples) / sr
-    waveform = np.sin(2 * np.pi * frequency * t)
-    load_and_play(awg, channel, waveform, segment_id)
-
+    t = np.arange(length)
+    load_and_play(awg, channel, np.sin(2 * np.pi * n * t / length), segment_id)
+    return n * sample_rate / length
 
 if __name__ == "__main__":
     with M8195A(host="WINDOWS-QNNRGV2") as awg:
         configure_single_channel(awg, amplitude=1.0)
-        generate_sine(awg, channel=1, frequency=1e6)
+        generate_sine(awg, channel=1, frequency=1e9)

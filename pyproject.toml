@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keysight-awg"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python driver for the Keysight M8195A 65 GSa/s Arbitrary Waveform Generator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,3 +19,6 @@ dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

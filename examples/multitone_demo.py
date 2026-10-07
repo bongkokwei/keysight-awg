@@ -23,9 +23,8 @@ HOST = "WINDOWS-QNNRGV2"
 CHANNEL = 1
 SEGMENT_ID = 1
 
-SAMPLE_RATE = 65e9  # Sa/s  — single-channel mode maximum
-GRANULARITY = 256  # samples — single-channel mode
-NUM_CYCLES = 1  # buffer covers 1 fundamental period
+SAMPLE_RATE = 64e9  # Sa/s
+LENGTH = 64_000  # samples — multiple of 256; resolution fs/L = 1 MHz exactly
 
 TONES = [
     ToneSpec(frequency=1e6, amplitude=1 / 3, phase_deg=0),
@@ -39,8 +38,7 @@ TONES = [
 
 gen = MultiToneGenerator(
     sample_rate=SAMPLE_RATE,
-    granularity=GRANULARITY,
-    num_cycles=NUM_CYCLES,
+    length=LENGTH,
     use_schroeder_phases=True,
 )
 
@@ -50,6 +48,7 @@ papr = gen.papr_db(waveform)
 print(f"Waveform length : {len(waveform):,} samples")
 print(f"Duration        : {len(waveform) / SAMPLE_RATE * 1e6:.3f} µs")
 print(f"PAPR            : {papr:.2f} dB")
+print(f"Tones played at : {[f / 1e6 for f in gen.actual_frequencies(TONES)]} MHz")
 
 # ---------------------------------------------------------------------------
 # 2.  Plot — time-domain excerpt + power spectrum
